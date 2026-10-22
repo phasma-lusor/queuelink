@@ -2,7 +2,7 @@
 
 Accept matches, pick, ban and swap runes in League of Legends from your phone.
 
-## For players (your friends)
+## For players
 
 1. Download **QueueLink.exe** and double-click it.
    - If Windows says "Windows protected your PC", click **More info**, then **Run anyway**. The app isn't code-signed yet, which is why Windows warns about it.
@@ -13,8 +13,6 @@ Accept matches, pick, ban and swap runes in League of Legends from your phone.
 Keep the black QueueLink window open while you play; closing it stops the app. Your phone stays paired, so next time just open QueueLink and reload the page on your phone.
 
 Lost the pairing page? Open `http://localhost:8080/pair` on the PC.
-
-## For you: building the .exe
 
 ## Under the hood
 

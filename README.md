@@ -16,29 +16,6 @@ Lost the pairing page? Open `http://localhost:8080/pair` on the PC.
 
 ## For you: building the .exe
 
-### Option A: GitHub builds it (recommended)
-
-1. Put this folder in a GitHub repo, including `.github/workflows/build.yml`.
-2. Every push to `main` builds the .exe. Find it under **Actions → latest run → Artifacts**.
-3. To publish a version for friends, create a tag such as `v1.0.0` (on GitHub: **Releases → Draft a new release → choose a tag**). The workflow attaches `QueueLink.exe` to the release.
-4. Use this permanent link for your Lovable download button. It always points to the newest release:
-   `https://github.com/<your-username>/<repo>/releases/latest/download/QueueLink.exe`
-
-### Option B: build it on your PC
-
-Install Python 3.9+ from python.org (tick "Add python.exe to PATH"), then double-click `build.bat`. The result is `dist\QueueLink.exe`.
-
-## Files
-
-| File | What it is |
-|---|---|
-| `server.py` | The app: connects to League, serves the phone UI and pairing page |
-| `index.html` | Phone UI, bundled inside the .exe |
-| `icon.ico` | App icon |
-| `build.bat` | One-click local build |
-| `.github/workflows/build.yml` | Automatic Windows build and releases |
-| `requirements.txt` | Python dependencies |
-
 ## Under the hood
 
 - **Finding League**: reads the port and token from the running `LeagueClientUx` process, falling back to the `lockfile`. It reconnects automatically if League restarts.

@@ -1,0 +1,4 @@
+aiohttp>=3.9
+python-socketio>=5.10
+psutil>=5.9      # optional: finds the client without needing the install path
+qrcode>=7.4      # optional: prints a QR code to scan with your phone

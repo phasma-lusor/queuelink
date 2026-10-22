@@ -6,9 +6,11 @@ QueueLink is a remote control for the League client. The League app on your PC r
 
 The pieces:
 
-QueueLink.exe on your PC connects to that hidden server. It watches for events like “match found” or “it’s your turn to pick,” and passes them to your phone instantly.
-Your phone opens a web page that the .exe serves over your Wi-Fi, so there’s no app to install. When you tap Accept or Lock In, the phone tells the .exe, and the .exe tells League.
-The QR code is just the address of your PC plus a 6-digit PIN. The PIN stops anyone else on your Wi-Fi from controlling your game. Phones only pair once.
+- QueueLink.exe on your PC connects to that hidden server. 
+- It watches for events like “match found” or “it’s your turn to pick,” and passes them to your phone instantly.
+- Your phone opens a web page that the .exe serves over your Wi-Fi, so there’s no app to install.
+- When you tap Accept or Lock In, the phone tells the .exe, and the .exe tells League.
+- The QR code is just the address of your PC plus a 6-digit PIN. The PIN stops anyone else on your Wi-Fi from controlling your game. Phones only pair once.
 
 ## For players
 

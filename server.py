@@ -73,6 +73,19 @@ AUTO_ACCEPT_DELAY = 0.4    # seconds; avoids racing the client's own popup
 # Champ-select session fields listing swap offers, keyed by the name the phone uses.
 SWAP_FIELDS = {"pickOrder": "pickOrderSwaps", "position": "positionSwaps", "trade": "trades"}
 SWAP_OPS = ("request", "accept", "decline", "cancel")
+_CS = "/lol-champ-select/v1/session"
+_TB = "/lol-lobby-team-builder/champ-select/v1/session"
+SWAP_ROUTES = {
+    "pickOrder": [f"{_CS}/pick-order-swaps", f"{_CS}/swaps", f"{_TB}/pick-order-swaps", f"{_TB}/swaps"],
+    "position": [f"{_CS}/position-swaps", f"{_CS}/swaps", f"{_TB}/position-swaps", f"{_TB}/swaps"],
+    "trade": [f"{_CS}/champion-swaps", f"{_CS}/trades", f"{_TB}/trades",
+              "/lol-champ-select-legacy/v1/session/trades"],
+}
+
+
+def _route_missing(result: dict) -> bool:
+    """True when the client says the URL itself doesn't exist (vs. refusing the action)."""
+    return result.get("status") == 404 or "invalid uri" in (result.get("error") or "").lower()
 
 # LCU events we relay. Each becomes a WAMP subscription "OnJsonApiEvent_<uri with / -> _>".
 SUBSCRIPTIONS = (
@@ -80,6 +93,9 @@ SUBSCRIPTIONS = (
     "/lol-matchmaking/v1/search",
     "/lol-matchmaking/v1/ready-check",
     "/lol-champ-select/v1/session",
+    # These lists update on their own, a moment after phases change, so we follow them live.
+    "/lol-champ-select/v1/pickable-champion-ids",
+    "/lol-champ-select/v1/bannable-champion-ids",
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
@@ -242,6 +258,7 @@ class Bridge:
         self._accepting = False
         self.champions: list[dict] = []
         self.spells: list[dict] = []
+        self._swap_route: dict[str, str] = {}
         self._reset_game_state()
 
     def _reset_game_state(self):
@@ -321,6 +338,18 @@ class Bridge:
                     self._cs_phase = phase
                     await self._load_champion_pool()
             await self.emit("champ_select", self.champ_select_view())
+
+        elif uri in ("/lol-champ-select/v1/pickable-champion-ids", "/lol-champ-select/v1/bannable-champion-ids"):
+            ids = set() if deleted or not isinstance(data, list) else {int(i) for i in data}
+            kind = "Pickable" if "pickable" in uri else "Bannable"
+            if kind == "Pickable":
+                changed, self.pickable = ids != self.pickable, ids
+            else:
+                changed, self.bannable = ids != self.bannable, ids
+            if changed:
+                log.info("%s list updated: %d champions", kind, len(ids))
+                if self.session:
+                    await self.emit("champ_select", self.champ_select_view())
 
     async def _load_champion_pool(self):
         self.pickable = set(await self.lcu.get("/lol-champ-select/v1/pickable-champion-ids") or [])
@@ -454,7 +483,7 @@ class Bridge:
         if status < 400:
             return {"ok": True}
         msg = (data or {}).get("message") if isinstance(data, dict) else None
-        return _err(msg or f"League client rejected the request ({status})")
+        return {**_err(msg or f"League client rejected the request ({status})"), "status": status}
 
     async def search_and_lock_champion(self, payload: dict) -> dict:
         if not self.lcu.connected:
@@ -551,19 +580,36 @@ class Bridge:
         if not self.session:
             return _err("You're not in champ select")
         sid = int(payload["id"])
-        if kind == "trade":  # renamed in newer clients; try the new name first
-            paths = [f"/lol-champ-select/v1/session/champion-swaps/{sid}/{op}",
-                     f"/lol-champ-select/v1/session/trades/{sid}/{op}"]
-        else:
-            paths = [f"/lol-champ-select/v1/session/swaps/{sid}/{op}"]
+        # Riot has renamed these routes between client versions. Try every known name,
+        # skipping ones this client says don't exist, and remember whichever works.
+        known = self._swap_route.get(kind)
+        routes = ([known] if known else []) + [r for r in SWAP_ROUTES[kind] if r != known]
         result = _err("Swap failed")
-        for path in paths:
-            result = await self.call("POST", path)
+        for route in routes:
+            result = await self.call("POST", f"{route}/{sid}/{op}")
             if result["ok"]:
-                log.info("Swap %s %s (%s)", kind, op, sid)
+                self._swap_route[kind] = route
+                log.info("Swap %s %s (%s) via %s", kind, op, sid, route)
                 return result
+            if not _route_missing(result):
+                break  # the route exists; League refused the swap itself
         log.warning("Swap %s %s (%s) failed: %s", kind, op, sid, result["error"])
+        if _route_missing(result):
+            await self._log_swap_functions()
+            return _err("This League version doesn't support that swap from QueueLink yet. Do it on the PC.")
         return result
+
+    async def _log_swap_functions(self):
+        """Ask the client which swap-related functions it has, so they show up in the window."""
+        if getattr(self, "_logged_help", False):
+            return
+        self._logged_help = True
+        status, data = await self.lcu.request("POST", "/help")
+        if status >= 400 or not isinstance(data, dict):
+            status, data = await self.lcu.request("GET", "/help")
+        funcs = data.get("functions", {}) if isinstance(data, dict) else {}
+        names = sorted(n for n in funcs if re.search(r"swap|trade", n, re.I) and "ChampSelect" in n)
+        log.info("Client swap functions: %s", ", ".join(names) or "(none listed)")
 
     async def set_spells(self, payload: dict) -> dict:
         if not self.session:

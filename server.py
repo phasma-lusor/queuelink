@@ -70,6 +70,10 @@ PAIR_TOKEN = load_pin()
 READY_CHECK_SECONDS = 12   # length of the in-client accept window
 AUTO_ACCEPT_DELAY = 0.4    # seconds; avoids racing the client's own popup
 
+# Champ-select session fields listing swap offers, keyed by the name the phone uses.
+SWAP_FIELDS = {"pickOrder": "pickOrderSwaps", "position": "positionSwaps", "trade": "trades"}
+SWAP_OPS = ("request", "accept", "decline", "cancel")
+
 # LCU events we relay. Each becomes a WAMP subscription "OnJsonApiEvent_<uri with / -> _>".
 SUBSCRIPTIONS = (
     "/lol-gameflow/v1/gameflow-phase",
@@ -245,6 +249,7 @@ class Bridge:
         self.queue = None
         self.ready_check = None
         self.session = None
+        self._cs_phase = None
         self.pickable: set[int] = set()
         self.bannable: set[int] = set()
 
@@ -305,11 +310,15 @@ class Bridge:
         elif uri == "/lol-champ-select/v1/session":
             if deleted:
                 self.session = None
+                self._cs_phase = None
                 self.pickable, self.bannable = set(), set()
             else:
                 starting = self.session is None
                 self.session = data
-                if starting or not self.pickable:
+                # The bannable/pickable lists change between planning, bans and picks.
+                phase = (data.get("timer") or {}).get("phase")
+                if starting or phase != self._cs_phase or not self.pickable:
+                    self._cs_phase = phase
                     await self._load_champion_pool()
             await self.emit("champ_select", self.champ_select_view())
 
@@ -356,16 +365,32 @@ class Bridge:
             if a.get("type") == "ban" and a.get("completed") and a.get("championId"):
                 bans["ally" if a.get("isAllyAction") else "enemy"].append(a["championId"])
 
+        # Pick order (1 = first pick) for each ally, from the order of pick actions.
+        pick_order: dict[int, int] = {}
+        for a in actions:
+            if a.get("type") == "pick" and a.get("isAllyAction") and a.get("actorCellId") not in pick_order:
+                pick_order[a.get("actorCellId")] = len(pick_order) + 1
+
         def member(m):
             return {
                 "cellId": m.get("cellId"),
                 "championId": m.get("championId") or 0,
                 "pickIntent": m.get("championPickIntent") or 0,
                 "position": m.get("assignedPosition") or "",
+                "name": m.get("gameName") or "",
+                "pickOrder": pick_order.get(m.get("cellId")),
                 "spell1Id": m.get("spell1Id"),
                 "spell2Id": m.get("spell2Id"),
                 "isMe": m.get("cellId") == me,
             }
+
+        # Swaps the client currently offers: pick order, role, champion trade.
+        swaps = []
+        for kind, field in SWAP_FIELDS.items():
+            for sw in s.get(field) or []:
+                state = sw.get("state")
+                if state in ("AVAILABLE", "SENT", "RECEIVED", "BUSY"):
+                    swaps.append({"kind": kind, "id": sw.get("id"), "cellId": sw.get("cellId"), "state": state})
 
         timer = s.get("timer") or {}
         return {
@@ -376,6 +401,7 @@ class Bridge:
             "myTeam": [member(m) for m in s.get("myTeam") or []],
             "theirTeam": [member(m) for m in s.get("theirTeam") or []],
             "bans": bans,
+            "swaps": swaps,
             "unavailable": sorted(locked),
             "pickable": sorted(self.pickable) or None,   # None = unknown, allow all
             "bannable": sorted(self.bannable) or None,
@@ -386,12 +412,18 @@ class Bridge:
     async def load_champions(self) -> list[dict]:
         if not self.champions:
             data = await self.lcu.get("/lol-game-data/assets/v1/champion-summary.json") or []
-            self.champions = sorted(
-                ({"id": c["id"], "name": c.get("name"), "alias": c.get("alias"),
-                  "roles": c.get("roles") or [], "icon": c.get("squarePortraitPath")}
-                 for c in data if c.get("id", -1) > 0),
-                key=lambda c: c["name"] or "",
-            )
+            # The list also has game-mode copies of champions (e.g. id 60103, alias "Jade_Ahri")
+            # with the same name and different art. Keep one entry per champion: the real one.
+            by_name: dict[str, dict] = {}
+            for c in sorted(data, key=lambda c: c.get("id", -1)):
+                cid, alias, name = c.get("id", -1), c.get("alias") or "", c.get("name") or ""
+                if cid <= 0 or "_" in alias or not name:
+                    continue
+                by_name.setdefault(_norm(name), {
+                    "id": cid, "name": name, "alias": alias,
+                    "roles": c.get("roles") or [], "icon": c.get("squarePortraitPath"),
+                })
+            self.champions = sorted(by_name.values(), key=lambda c: c["name"])
         return self.champions
 
     async def load_spells(self) -> list[dict]:
@@ -457,13 +489,65 @@ class Bridge:
         if lock and not action["isInProgress"]:
             lock, note = False, "Not your turn yet, so it's hovered instead"
 
-        result = await self.call(
-            "PATCH", f"/lol-champ-select/v1/session/actions/{action['id']}",
-            {"championId": cid, "completed": lock},
-        )
+        path = f"/lol-champ-select/v1/session/actions/{action['id']}"
+        verb = "ban" if action["type"] == "ban" else "pick"
+
+        # Step 1: hover the champion (works for picks and bans).
+        result = await self.call("PATCH", path, {"championId": cid})
         if not result["ok"]:
+            log.warning("Hover for %s %s failed: %s", verb, cid, result["error"])
             return result
-        return {"ok": True, "championId": cid, "locked": lock, "type": action["type"], "message": note}
+        if not lock:
+            return {"ok": True, "championId": cid, "locked": False, "type": action["type"], "message": note}
+
+        # Step 2: confirm it. Newer clients use POST …/complete; older ones accept completed=true.
+        result = await self.call("POST", path + "/complete")
+        if not result["ok"]:
+            log.info("POST complete failed (%s), retrying with PATCH", result["error"])
+            result = await self.call("PATCH", path, {"championId": cid, "completed": True})
+        if not result["ok"]:
+            log.warning("Locking %s %s failed: %s", verb, cid, result["error"])
+            return result
+
+        # Step 3: make sure League actually registered it.
+        if not await self._action_completed(action["id"]):
+            log.warning("League didn't complete %s action %s", verb, action["id"])
+            return _err(f"League didn't accept the {verb}. It's hovered, so tap {verb.title()} again or confirm on the PC.")
+        log.info("%s confirmed: champion %s", verb.title(), cid)
+        return {"ok": True, "championId": cid, "locked": True, "type": action["type"], "message": note}
+
+    async def _action_completed(self, action_id: int) -> bool:
+        for _ in range(4):
+            status, session = await self.lcu.request("GET", "/lol-champ-select/v1/session")
+            if status < 400 and session:
+                for turn in session.get("actions") or []:
+                    for a in turn:
+                        if a.get("id") == action_id and a.get("completed"):
+                            return True
+            await asyncio.sleep(0.25)
+        return False
+
+    async def swap(self, payload: dict) -> dict:
+        """Request, accept, decline or cancel a pick-order, role or champion swap."""
+        kind, op = payload.get("kind"), payload.get("op")
+        if kind not in SWAP_FIELDS or op not in SWAP_OPS or payload.get("id") is None:
+            return _err("Invalid swap request")
+        if not self.session:
+            return _err("You're not in champ select")
+        sid = int(payload["id"])
+        if kind == "trade":  # renamed in newer clients; try the new name first
+            paths = [f"/lol-champ-select/v1/session/champion-swaps/{sid}/{op}",
+                     f"/lol-champ-select/v1/session/trades/{sid}/{op}"]
+        else:
+            paths = [f"/lol-champ-select/v1/session/swaps/{sid}/{op}"]
+        result = _err("Swap failed")
+        for path in paths:
+            result = await self.call("POST", path)
+            if result["ok"]:
+                log.info("Swap %s %s (%s)", kind, op, sid)
+                return result
+        log.warning("Swap %s %s (%s) failed: %s", kind, op, sid, result["error"])
+        return result
 
     async def set_spells(self, payload: dict) -> dict:
         if not self.session:
@@ -562,6 +646,10 @@ async def _pick(d):
 @action("set_auto_accept")
 async def _auto(d):
     return await bridge.set_auto_accept(d)
+
+@action("swap")
+async def _swap(d):
+    return await bridge.swap(d)
 
 @action("set_spells")
 async def _spells(d):
